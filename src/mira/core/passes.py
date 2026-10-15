@@ -273,13 +273,42 @@ def _hunk_evidence(comment: ReviewComment, diff_files: list | None) -> str:
         return ""
     end = comment.end_line or comment.line
     parts = []
+    anchor: tuple[int, int] | None = None
+    offset = 0
     for h in file.hunks:
         h_end = h.target_start + max(h.target_length, 1) - 1
         if comment.line <= h_end and h.target_start <= end:
             parts.append(h.content)
+            if anchor is None:
+                target_line = h.target_start
+                row_offset = offset
+                # Unified diff rows are LF-delimited; removals and headers do
+                # not advance target coordinates.
+                for row in h.content.split("\n"):
+                    if row.startswith(("+", " ")):
+                        if comment.line <= target_line <= end:
+                            anchor = (
+                                row_offset,
+                                min(row_offset + len(row) + 1, offset + len(h.content)),
+                            )
+                            break
+                        target_line += 1
+                    row_offset += len(row) + 1
+            offset += len(h.content) + 1
     text = "\n".join(parts)
     if len(text) > _MAX_HUNK_EVIDENCE_CHARS:
-        text = text[:_MAX_HUNK_EVIDENCE_CHARS] + "…"
+        budget = _MAX_HUNK_EVIDENCE_CHARS - 4  # both omission markers
+        row_start, row_end = anchor or (0, 0)
+        context = max(0, (budget - (row_end - row_start)) // 2)
+        start = min(max(0, row_start - context), len(text) - budget)
+        stop = start + budget
+        markers = (2 if row_start else 0) + (2 if row_end < len(text) else 0)
+        if (
+            row_end - row_start > budget
+            and row_end - row_start + markers <= _MAX_HUNK_EVIDENCE_CHARS
+        ):
+            start, stop = row_start, row_end
+        text = ("…\n" if start else "") + text[start:stop] + ("\n…" if stop < len(text) else "")
     return text
 
 

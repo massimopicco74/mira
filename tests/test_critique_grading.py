@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from mira.core.passes import _critique_keep, _hunk_evidence, self_critique
+from mira.core.passes import (
+    _MAX_HUNK_EVIDENCE_CHARS,
+    _critique_keep,
+    _hunk_evidence,
+    self_critique,
+)
 from mira.models import FileChangeType, FileDiff, HunkInfo, ReviewComment, Severity
 
 
@@ -81,8 +86,133 @@ class TestHunkEvidence:
         out = _hunk_evidence(_comment(line=10), [f])
         assert len(out) < 1300
 
+    def test_late_cited_line_is_kept_inside_evidence_cap(self):
+        content = "@@ -1,80 +1,80 @@\n" + "".join(
+            f"+line {line:02d} {'x' * 30}\n" for line in range(1, 81)
+        )
+        f = FileDiff(
+            path="app.py",
+            change_type=FileChangeType.MODIFIED,
+            hunks=[HunkInfo(1, 80, 1, 80, content)],
+        )
+
+        out = _hunk_evidence(_comment(line=78), [f])
+
+        assert "+line 78" in out
+        assert len(out) <= _MAX_HUNK_EVIDENCE_CHARS
+
+    def test_removed_rows_do_not_advance_target_line(self):
+        content = (
+            "@@ -10,102 +10,3 @@\n"
+            " context line 10\n"
+            + "".join(f"-removed {i}\n" for i in range(1, 101))
+            + "+target line 11\n"
+            " context line 12\n"
+        )
+        f = FileDiff(
+            path="app.py",
+            change_type=FileChangeType.MODIFIED,
+            hunks=[HunkInfo(10, 102, 10, 3, content)],
+        )
+
+        out = _hunk_evidence(_comment(line=11), [f])
+
+        assert "+target line 11" in out
+
+    @pytest.mark.parametrize("separator", ["\u2028", "\v", "\r"])
+    def test_non_lf_separators_do_not_split_diff_rows(self, separator):
+        content = "@@ -1 +1 @@\n" + "-old" + separator + "x" * 1600 + "\n+actual target\n"
+        f = FileDiff(
+            path="app.py",
+            change_type=FileChangeType.MODIFIED,
+            hunks=[HunkInfo(1, 1, 1, 1, content)],
+        )
+
+        out = _hunk_evidence(_comment(line=1), [f])
+
+        assert "+actual target" in out
+        assert len(out) <= _MAX_HUNK_EVIDENCE_CHARS
+
+    def test_oversized_cited_row_is_visibly_truncated(self):
+        content = "@@ -1 +1 @@\n+" + "x" * (_MAX_HUNK_EVIDENCE_CHARS + 100)
+        f = FileDiff(
+            path="app.py",
+            change_type=FileChangeType.MODIFIED,
+            hunks=[HunkInfo(1, 1, 1, 1, content)],
+        )
+
+        out = _hunk_evidence(_comment(line=1), [f])
+
+        assert out.endswith("\n…")
+        assert len(out) <= _MAX_HUNK_EVIDENCE_CHARS
+
+    def test_final_cited_row_fits_with_only_prefix_marker(self):
+        anchor = "+" + "z" * 1196 + "\n"
+        content = "@@ -1 +1 @@\n-" + "x" * 1600 + "\n" + anchor
+        f = FileDiff(
+            path="app.py",
+            change_type=FileChangeType.MODIFIED,
+            hunks=[HunkInfo(1, 1, 1, 1, content)],
+        )
+
+        out = _hunk_evidence(_comment(line=1), [f])
+
+        assert out == "…\n" + anchor
+        assert len(out) == _MAX_HUNK_EVIDENCE_CHARS
+
+    def test_later_hunk_is_selected_without_earlier_context(self):
+        first = "@@ -1,20 +1,20 @@\n" + "".join(
+            f"+first {line} {'x' * 50}\n" for line in range(1, 21)
+        )
+        second = "@@ -100,20 +100,20 @@\n" + "".join(
+            f"+second {line} {'y' * 50}\n" for line in range(100, 120)
+        )
+        f = FileDiff(
+            path="app.py",
+            change_type=FileChangeType.MODIFIED,
+            hunks=[HunkInfo(1, 20, 1, 20, first), HunkInfo(100, 20, 100, 20, second)],
+        )
+
+        out = _hunk_evidence(_comment(line=118), [f])
+
+        assert "+second 118" in out
+        assert "+first" not in out
+        assert len(out) <= _MAX_HUNK_EVIDENCE_CHARS
+
+    def test_short_hunk_is_returned_unchanged(self):
+        content = "@@ -8,2 +8,2 @@\n context\n+changed\n"
+        f = FileDiff(
+            path="app.py",
+            change_type=FileChangeType.MODIFIED,
+            hunks=[HunkInfo(8, 2, 8, 2, content)],
+        )
+
+        assert _hunk_evidence(_comment(line=9), [f]) == content
+
 
 class TestEvidenceGradedCritique:
+    @pytest.mark.asyncio
+    async def test_critic_receives_late_cited_line_from_long_hunk(self):
+        content = "@@ -1,80 +1,80 @@\n" + "".join(
+            f"+line {line:02d} {'x' * 30}\n" for line in range(1, 81)
+        )
+        f = FileDiff(
+            path="app.py",
+            change_type=FileChangeType.MODIFIED,
+            hunks=[HunkInfo(1, 80, 1, 80, content)],
+        )
+        comment = _comment(line=78, severity=Severity.BLOCKER)
+        critic = AsyncMock()
+        critic.complete_with_tools.return_value = json.dumps(
+            {"verdicts": [{"index": 0, "evidence": "proven", "reason": "shown in diff"}]}
+        )
+
+        kept = await self_critique(AsyncMock(), [comment], indexing_llm=critic, diff_files=[f])
+
+        prompt = critic.complete_with_tools.call_args.kwargs["messages"][0]["content"]
+        assert "+line 78" in prompt
+        assert kept == [comment]
+
     @pytest.mark.asyncio
     async def test_grades_applied_through_llm_flow(self, monkeypatch):
         comments = [
